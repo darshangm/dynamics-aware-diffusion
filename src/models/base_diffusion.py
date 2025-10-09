@@ -220,4 +220,4 @@ class DiffusionMethod(ABC):
     
     def get_model_save_name(self, epoch):
         """Generate standardized model save name."""
-        return f"{self.get_method_name()}_diffusion_model_epoch_{epoch}.pt"s
+        return f"{self.get_method_name()}_diffusion_model_epoch_{epoch}.pt"

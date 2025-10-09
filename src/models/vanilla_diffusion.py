@@ -92,4 +92,4 @@ def load_vanilla_model(model_path, input_dim, condition_dim, seq_len=30, device=
     if 'epoch' in checkpoint:
         print(f"Trained for {checkpoint['epoch']} epochs")
     
-    return model, trainers
+    return model, trainer

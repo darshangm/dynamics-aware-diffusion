@@ -1,2 +1,4 @@
 from .base_diffusion import BaseDiffusionModel, DiffusionMethod
 from .vanilla_diffusion import VanillaDiffusion, VanillaDiffusionModel, load_vanilla_model
+from .model_based_diffusion import ModelBasedDiffusion, ModelBasedDiffusionModel, load_model_based_model
+from .hankel_diffusion import HankelDiffusion, HankelDiffusionModel, load_hankel_model
