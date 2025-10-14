@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# PyCharm
+.idea/
+
+# VSCode
+.vscode/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Data and logs
+logs/
+data/
+datasets/
+*.pkl
+*.pt
+*.pth
+*.h5
+*.hdf5
+wandb/
+runs/
+
+# Minari datasets
+~/.minari/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.swp
+*.swo
+*~
+.tmp/
+temp/
+
+# Config files (keep templates)
+config/*.yaml
+!config/examples/
+
+# Checkpoints
+checkpoints/
+*.ckpt
+
+# Videos and renders
+videos/
+renders/
+*.mp4
+*.avi
+*.gif

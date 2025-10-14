@@ -1,0 +1,53 @@
+# HalfCheetah experiment configuration
+
+# Dataset
+dataset:
+  name: "halfcheetah-medium-v0"
+  horizon: 64
+  max_path_length: 1000
+  discount: 0.99
+  returns_scale: 1000.0
+
+# Model architecture
+model:
+  dim: 128
+  dim_mults: [1, 2, 4, 8]
+  kernel_size: 5
+  
+# Diffusion
+diffusion:
+  n_timesteps: 1000
+  beta_schedule: "cosine"  # or "linear"
+  loss_type: "l2"
+  clip_denoised: true
+  predict_epsilon: true
+
+# Training
+training:
+  n_epochs: 100
+  batch_size: 32
+  learning_rate: 2e-4
+  warmup_steps: 1000
+  gradient_clip: 1.0
+  
+  # EMA
+  use_ema: true
+  ema_decay: 0.995
+  
+  # Logging
+  log_freq: 100
+  save_freq: 10000
+  eval_freq: 5000
+  
+# Evaluation
+evaluation:
+  env_name: "HalfCheetah-v5"
+  n_episodes: 10
+  policy_type: "guided"  # or "mpc"
+  action_horizon: 8  # for MPC
+
+# System
+system:
+  device: "cuda"
+  num_workers: 0
+  seed: 42
