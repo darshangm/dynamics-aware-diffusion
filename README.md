@@ -1,6 +1,5 @@
-# Modern Diffuser with Dynamics-Aware Planning
+# Dynamics-aware Diffusion Models for Planning and Control
 
-A PyTorch implementation of **Dynamics-aware Diffusion Models for Planning and Control** **Diffuser** adapted for **Gymnasium** and modern tooling.
 
 ## Repository based on
  **Planning with Diffusion for Flexible Behavior Synthesis**  
