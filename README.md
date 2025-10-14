@@ -16,7 +16,7 @@ This implementation modernizes the original Diffuser codebase and adds dynamics-
 
 ---
 
-## 🎯 Key Feature: Dynamics-Aware Diffusion
+## Key Feature: Dynamics-Aware Diffusion
 
 Standard diffusion models can generate trajectories that **violate physical constraints**. Our dynamics-aware extension integrates system dynamics directly into the sampling process via **projection-based denoising**:
 ```
