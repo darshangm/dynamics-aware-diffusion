@@ -26,7 +26,7 @@ def parse_args():
     # Dataset
     parser.add_argument('--dataset', type=str, default='halfcheetah-medium-v0',
                        help='Minari dataset name')
-    parser.add_argument('--horizon', type=int, default=64,
+    parser.add_argument('--horizon', type=int, default=8,
                        help='Planning horizon length')
     
     # Model

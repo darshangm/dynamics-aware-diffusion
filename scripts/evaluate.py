@@ -3,6 +3,8 @@ Evaluation script for trained Diffuser models.
 """
 
 import sys
+import json
+from datetime import datetime
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -32,7 +34,7 @@ def parse_args():
                        help='Gymnasium environment name')
     parser.add_argument('--n-episodes', type=int, default=10,
                        help='Number of evaluation episodes')
-    parser.add_argument('--policy-type', type=str, default='guided',
+    parser.add_argument('--policy-type', type=str, default='mpc',
                        choices=['guided', 'mpc','dynamics-aware'],
                        help='Policy type to use')
     parser.add_argument('--action-horizon', type=int, default=8,
@@ -166,8 +168,8 @@ def evaluate_policy(policy, env, n_episodes: int, render: bool = False):
             action = policy.get_action(obs)
             
             # DEBUG: Print first few actions
-            if episode_length < 3:
-                print(f"Step {episode_length}: action={action}, magnitude={np.linalg.norm(action):.4f}")
+            # if episode_length < 3:
+            #     print(f"Step {episode_length}: action={action}, magnitude={np.linalg.norm(action):.4f}")
             
             # Clip action to environment bounds
             if hasattr(env.action_space, 'low'):
@@ -299,28 +301,30 @@ def main():
     elif args.policy_type == 'mpc':
         policy = MPCPolicy(diffusion, normalizer, action_horizon=args.action_horizon)
     elif args.policy_type == 'dynamics-aware':
-        # Extract dynamics for environment
         from m_diffuser.dynamics import get_dynamics_for_env, ProjectionMatrixBuilder
         
         print("Extracting dynamics for environment...")
-        A, B, state_dim, action_dim_dynamics = get_dynamics_for_env(args.env)
-        
-        print(f"  State dim: {state_dim}, Action dim: {action_dim_dynamics}")
-        print(f"  A matrix shape: {A.shape}, B matrix shape: {B.shape}")
+        A, B, state_dim, action_dim_dynamics = get_dynamics_for_env(
+            args.env, dataset_name=dataset_name
+        )
         
         print(f"Building projection matrix for horizon={diffusion.horizon}...")
         proj_builder = ProjectionMatrixBuilder(A, B, state_dim, action_dim_dynamics)
-        P = proj_builder.get_projection_matrix(diffusion.horizon)
+        P = proj_builder.get_projection_matrix(
+            diffusion.horizon,
+            interleaved=True  # ← Direct interleaved format!
+        )
         
         print(f"  Projection matrix P shape: {P.shape}")
-        print(f"  P is projection: {torch.allclose(P @ P, P, atol=1e-4)}")
+        print(f"  Format: interleaved (no conversion needed)")
         
         policy = DynamicsAwarePolicy(
             diffusion_model=diffusion,
             normalizer=normalizer,
             projection_matrix=P,
             state_dim=state_dim,
-            action_dim=action_dim_dynamics
+            action_dim=action_dim_dynamics,
+            action_horizon=args.action_horizon
         )
     else:
         raise ValueError(f"Unknown policy type: {args.policy_type}")

@@ -1,7 +1,12 @@
-# m_diffuser/guides/__init__.py
-"""Planning policies and guidance mechanisms."""
+"""
+Guided diffusion policies.
+"""
 
-from .policies import GuidedPolicy, ValueGuidedPolicy, RewardWeightedPolicy, MPCPolicy
+from .policies import GuidedPolicy, ValueGuidedPolicy, MPCPolicy, DynamicsAwarePolicy
 
-__all__ = ['GuidedPolicy', 'ValueGuidedPolicy', 'RewardWeightedPolicy', 'MPCPolicy']
-
+__all__ = [
+    'GuidedPolicy',
+    'ValueGuidedPolicy',
+    'MPCPolicy',
+    'DynamicsAwarePolicy',
+]

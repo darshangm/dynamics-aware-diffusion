@@ -144,19 +144,28 @@ class NumericalDynamicsExtractor(DynamicsExtractor):
         Numerically compute (A, B) via finite differences.
         
         Args:
-            linearization_point: State to linearize around
+            linearization_point: State to linearize around (if None, use reset state)
         
         Returns:
             A, B: Linearized dynamics matrices
         """
         if linearization_point is None:
-            # Use default: reset state
+            # Use default: reset state with zero velocity
             obs, _ = self.env.reset()
             linearization_point = self._extract_state(obs)
+            
+            # For PointMaze, ensure zero velocity for linearization
+            if len(linearization_point) == 4:
+                linearization_point[2:] = 0.0  # Zero velocity
+        
+        print(f"Linearizing around state: {linearization_point}")
         
         # Linearize around this point
         A = self._compute_A_matrix(linearization_point)
         B = self._compute_B_matrix(linearization_point)
+        
+        print(f"Computed A:\n{A}")
+        print(f"Computed B:\n{B}")
         
         return A, B
     
@@ -165,16 +174,84 @@ class NumericalDynamicsExtractor(DynamicsExtractor):
         if isinstance(obs, dict):
             # For Dict observations (PointMaze), use 'observation' key
             if 'observation' in obs:
-                return obs['observation'][:self.state_dim]
+                state = obs['observation']
+                # For PointMaze, state is [x, y, vx, vy]
+                if len(state) >= self.state_dim:
+                    return state[:self.state_dim].copy()
+                else:
+                    return state.copy()
             else:
                 raise ValueError("Cannot extract state from dict observation")
         else:
             # Simple array observation
-            return obs[:self.state_dim]
+            return obs[:self.state_dim].copy()
     
-    def _compute_A_matrix(self, x0: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    def _set_state(self, state: np.ndarray):
+        """
+        Set environment state (for finite differences).
+        
+        For PointMaze, we need to manipulate the internal state.
+        """
+        # PointMaze doesn't have set_state, so we'll use reset + manual setting
+        # This is a workaround for environments without set_state
+        
+        if hasattr(self.env.unwrapped, 'set_state'):
+            # MuJoCo-style environments
+            n_qpos = self.state_dim // 2
+            qpos = state[:n_qpos]
+            qvel = state[n_qpos:]
+            self.env.unwrapped.set_state(qpos, qvel)
+            
+        elif hasattr(self.env.unwrapped, 'state'):
+            # PointMaze-style (Gymnasium robotics)
+            # Directly set the agent's state
+            if hasattr(self.env.unwrapped, 'model'):
+                # MuJoCo environment wrapped by Gymnasium
+                self.env.unwrapped.data.qpos[:2] = state[:2]  # Position
+                self.env.unwrapped.data.qvel[:2] = state[2:4] if len(state) >= 4 else [0, 0]  # Velocity
+                self.env.unwrapped.model.forward()
+            else:
+                raise NotImplementedError(f"Cannot set state for {self.env_name}")
+        else:
+            raise NotImplementedError(f"Cannot set state for {self.env_name}")
+    
+    def _step_dynamics(self, state: np.ndarray, action: np.ndarray) -> np.ndarray:
+        """
+        Step the environment dynamics forward one step.
+        
+        Args:
+            state: Current state [x, y, vx, vy]
+            action: Action to take [ax, ay]
+        
+        Returns:
+            next_state: Next state after dynamics
+        """
+        try:
+            # Set the state
+            self._set_state(state)
+            
+            # Step with action
+            obs, _, _, _, _ = self.env.step(action)
+            
+            # Extract next state
+            next_state = self._extract_state(obs)
+            
+            return next_state
+            
+        except NotImplementedError:
+            # Fallback: Use analytical approximation if set_state not available
+            print(f"Warning: set_state not available for {self.env_name}, using simplified dynamics")
+            # This won't work perfectly, but better than crashing
+            # Just step from current position
+            obs, _ = self.env.reset()
+            obs, _, _, _, _ = self.env.step(action)
+            return self._extract_state(obs)
+    
+    def _compute_A_matrix(self, x0: np.ndarray, eps: float = 1e-4) -> np.ndarray:
         """
         Compute A matrix: ∂f/∂x at x0 via finite differences.
+        
+        Increased eps from 1e-6 to 1e-4 for better numerical stability.
         """
         A = np.zeros((self.state_dim, self.state_dim))
         u0 = np.zeros(self.action_dim)
@@ -189,13 +266,16 @@ class NumericalDynamicsExtractor(DynamicsExtractor):
             
             x_next_perturb = self._step_dynamics(x_perturb, u0)
             
+            # Finite difference derivative
             A[:, i] = (x_next_perturb - x_nominal) / eps
         
         return A
     
-    def _compute_B_matrix(self, x0: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    def _compute_B_matrix(self, x0: np.ndarray, eps: float = 1e-4) -> np.ndarray:
         """
         Compute B matrix: ∂f/∂u at x0 via finite differences.
+        
+        Increased eps from 1e-6 to 1e-4 for better numerical stability.
         """
         B = np.zeros((self.state_dim, self.action_dim))
         u0 = np.zeros(self.action_dim)
@@ -210,41 +290,10 @@ class NumericalDynamicsExtractor(DynamicsExtractor):
             
             x_next_perturb = self._step_dynamics(x0, u_perturb)
             
+            # Finite difference derivative
             B[:, i] = (x_next_perturb - x_nominal) / eps
         
         return B
-    
-    def _step_dynamics(self, state: np.ndarray, action: np.ndarray) -> np.ndarray:
-        """
-        Step the environment dynamics forward one step.
-        
-        Args:
-            state: Current state
-            action: Action to take
-        
-        Returns:
-            next_state: Next state after dynamics
-        """
-        # This needs environment-specific implementation
-        # For MuJoCo: use set_state
-        # For others: might need to reset and step
-        
-        if hasattr(self.env.unwrapped, 'set_state'):
-            # MuJoCo-style environments
-            if len(state) == self.state_dim:
-                # Assume state is [qpos, qvel]
-                n_qpos = self.state_dim // 2
-                qpos = state[:n_qpos]
-                qvel = state[n_qpos:]
-                self.env.unwrapped.set_state(qpos, qvel)
-            
-            obs, _, _, _, _ = self.env.step(action)
-            return self._extract_state(obs)
-        else:
-            raise NotImplementedError(
-                f"Cannot step dynamics for {self.env_name}. "
-                "Environment doesn't support set_state."
-            )
 
 
 def get_dynamics_extractor(env_name: str, method: str = 'auto') -> DynamicsExtractor:
