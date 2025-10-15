@@ -60,26 +60,6 @@ pyyaml
 pip install -r requirements.txt
 ```
 
-### Troubleshooting
-
-**MuJoCo Version Conflicts:**
-```bash
-pip uninstall dm-control
-```
-
-**Dataset Download Issues:**
-```bash
-pip install minari --upgrade
-```
-
-**CUDA Out of Memory:**
-```bash
-# Reduce batch size or horizon
-python scripts/train.py --batch-size 128 --horizon 32
-```
-
----
-
 ### Step 2: Download Data
 ```bash
 # List available datasets
