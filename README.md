@@ -1,6 +1,6 @@
-# Modern Diffuser with Dynamics-Aware Planning
+# Dynamics-aware Diffusion Models for Planning and Control
 
-A PyTorch implementation of **Dynamics-aware Diffusion Models for Planning and Control** **Diffuser** adapted for **Gymnasium** and modern tooling.
+## Based on the paper 'Dynamics-aware Diffusion Models for Planning and Control', Darshan Gadginmath, Fabio Pasqualetti, Conference on Decision and Control, December 2025, Rio de Janeiro
 
 ## Repository based on
  **Planning with Diffusion for Flexible Behavior Synthesis**  
@@ -9,15 +9,15 @@ A PyTorch implementation of **Dynamics-aware Diffusion Models for Planning and C
 diffusion-planner.github.io
 
 This implementation modernizes the original Diffuser codebase and adds dynamics-aware extensions, with modern Gymnasium and RL datasets:
-- ✅ **Gymnasium** (instead of deprecated gym)
-- ✅ **Minari** datasets (instead of D4RL)
-- ✅ **Modern MuJoCo** (instead of mujoco-py)
-- ✅ **Dynamics-aware projection** (ensures physical feasibility)
-- ✅ **Windows compatibility**
+- **Gymnasium** (instead of deprecated gym)
+- **Minari** datasets (instead of D4RL)
+- **Modern MuJoCo** (instead of mujoco-py)
+- **Dynamics-aware projection** (ensures physical feasibility)
+- **Windows compatibility**
 
 ---
 
-## 🎯 Key Feature: Dynamics-Aware Diffusion
+## Key Feature: Dynamics-Aware Diffusion
 
 Standard diffusion models can generate trajectories that **violate physical constraints**. Our dynamics-aware extension integrates system dynamics directly into the sampling process via **projection-based denoising**:
 ```
@@ -26,24 +26,59 @@ Dynamics-aware:   x_{i-1} = project(denoise(x_i), dynamics)
 ```
 
 **Benefits:**
-- ✅ Generated trajectories satisfy dynamics constraints
-- ✅ No retraining required (plug-and-play at inference)
-- ✅ Works with both known and unknown dynamics
-- ✅ Improves trajectory feasibility and task performance
+-  Generated trajectories satisfy dynamics constraints
+-  No retraining required (plug-and-play at inference)
+-  Works with both known and unknown dynamics
+-  Improves trajectory feasibility and task performance
 
 ---
 
-## 🚀 Quick Start Workflow
+## Quick Start Workflow
 
 ### Step 1: Installation
-```bash
-# Create conda environment
-conda create -n modern_diffuser python=3.9
-conda activate modern_diffuser
 
-# Install dependencies
+### Prerequisites
+- Python 3.9+
+- CUDA 11.0+ (for GPU support)
+- Conda (recommended)
+
+### Required Packages
+```
+gymnasium>=1.0.0
+gymnasium-robotics>=1.3.0
+minari>=0.4.0
+torch>=2.0.0
+numpy
+einops
+matplotlib
+tqdm
+pyyaml
+```
+
+### Install from requirements.txt
+```bash
 pip install -r requirements.txt
 ```
+
+### Troubleshooting
+
+**MuJoCo Version Conflicts:**
+```bash
+pip uninstall dm-control
+```
+
+**Dataset Download Issues:**
+```bash
+pip install minari --upgrade
+```
+
+**CUDA Out of Memory:**
+```bash
+# Reduce batch size or horizon
+python scripts/train.py --batch-size 128 --horizon 32
+```
+
+---
 
 ### Step 2: Download Data
 ```bash
@@ -56,8 +91,6 @@ python scripts/download_data.py --dataset D4RL/pointmaze/umaze-v2
 # Check what's downloaded
 python scripts/download_data.py --list-local
 ```
-
-Datasets are stored in `~/.minari/datasets/`
 
 ### Step 3: Train Model
 ```bash
@@ -114,89 +147,9 @@ python scripts/evaluate.py \
 
 **Note:** Using the same `--seed 42` ensures both methods are evaluated on identical episodes for fair comparison.
 
-### Step 5: Compare Results
-```bash
-python scripts/compare_results.py \
-    results/vanilla/guided_*.json \
-    results/dynamics/dynamics_aware_*.json
-```
 
-**Expected output:**
-```
-======================================================================
-POLICY COMPARISON
-======================================================================
-Environment: PointMaze_UMaze-v3
-Episodes: 10
 
-REWARDS:
-  Vanilla (guided):     -12.45 ± 2.31
-  Dynamics-aware:       -10.23 ± 1.85
-  Improvement:          +17.8%
-======================================================================
-```
-
----
-
-## 📦 Installation Details
-
-### Prerequisites
-- Python 3.9+
-- CUDA 11.0+ (for GPU support)
-- Conda (recommended)
-
-### Required Packages
-```
-gymnasium>=1.0.0
-gymnasium-robotics>=1.3.0
-minari>=0.4.0
-torch>=2.0.0
-numpy
-einops
-matplotlib
-tqdm
-pyyaml
-```
-
-### Install from requirements.txt
-```bash
-pip install -r requirements.txt
-```
-
-### Troubleshooting
-
-**MuJoCo Version Conflicts:**
-```bash
-pip uninstall dm-control
-```
-
-**Dataset Download Issues:**
-```bash
-pip install minari --upgrade
-```
-
-**CUDA Out of Memory:**
-```bash
-# Reduce batch size or horizon
-python scripts/train.py --batch-size 128 --horizon 32
-```
-
----
-
-## 📊 Datasets
-
-### Available Datasets
-
-| Environment | Dataset Name | State Dim | Action Dim | Episodes |
-|------------|--------------|-----------|------------|----------|
-| **PointMaze** | `D4RL/pointmaze/umaze-v2` | 4 | 2 | ~1000 |
-| | `D4RL/pointmaze/medium-v2` | 4 | 2 | ~1000 |
-| | `D4RL/pointmaze/large-v2` | 4 | 2 | ~1000 |
-| **HalfCheetah** | `D4RL/halfcheetah/medium-v2` | 17 | 6 | 1000 |
-| **Hopper** | `D4RL/hopper/medium-v2` | 11 | 3 | 1000 |
-| **Walker2d** | `D4RL/walker2d/medium-v2` | 17 | 6 | 1000 |
-| **AdroitHand** | `D4RL/door/expert-v2` | 39 | 28 | 5000 |
-| | `D4RL/pen/expert-v2` | 45 | 24 | 5000 |
+## Datasets
 
 ### Download Commands
 ```bash
@@ -216,9 +169,7 @@ python scripts/download_data.py --dataset D4RL/door/expert-v2
 
 ---
 
-## 🏋️ Training
-
-### Recommended Hyperparameters
+## Training
 
 #### PointMaze (Fast Training, Good for Testing)
 ```bash
@@ -237,7 +188,6 @@ python scripts/train.py \
     --ema-decay 0.995 \
     --device cuda
 ```
-**Training time:** ~30 minutes on RTX 3090
 
 #### HalfCheetah (Locomotion Benchmark)
 ```bash
@@ -255,7 +205,6 @@ python scripts/train.py \
     --use-ema \
     --device cuda
 ```
-**Training time:** ~2 hours on RTX 3090
 
 #### AdroitHand Door (Complex Manipulation)
 ```bash
@@ -273,7 +222,6 @@ python scripts/train.py \
     --use-ema \
     --device cuda
 ```
-**Training time:** ~4 hours on RTX 3090
 
 ### Training Arguments
 
@@ -294,7 +242,6 @@ python scripts/train.py \
 | `--device` | cuda | Device (cuda/cpu) |
 | `--log-dir` | ./logs | Checkpoint directory |
 
-**⚠️ Important:** Default `--gradient-clip 1.0` is too aggressive for most tasks. Use `5.0` or higher for better convergence.
 
 ### Monitoring Training
 
@@ -310,7 +257,7 @@ Checkpoints saved every epoch:
 
 ---
 
-## 🎮 Evaluation
+## Evaluation
 
 ### Policy Types
 
@@ -456,7 +403,6 @@ m_diffuser/
 │   ├── train.py                  # Training script
 │   ├── evaluate.py               # Evaluation script
 │   ├── download_data.py          # Dataset downloader
-│   └── compare_results.py        # Compare policies
 ├── config/                       # Config files
 ├── logs/                         # Training checkpoints
 ├── results/                      # Evaluation results (JSON)
@@ -467,107 +413,8 @@ m_diffuser/
 
 ---
 
-## 🔬 Technical Details
 
-### 1. Temporal U-Net (from Janner et al., 2022)
-
-Architecture components:
-- **1D Convolutions**: Process temporal sequences
-- **Residual Blocks**: Skip connections with GroupNorm
-- **Time Conditioning**: Sinusoidal embeddings
-- **Multi-Scale**: Encoder-decoder with dimension multipliers
-- **Attention**: Optional self-attention layers
-```python
-unet = TemporalUnet(
-    transition_dim=state_dim + action_dim,
-    dim=128,                    # Base dimension
-    dim_mults=(1, 2, 4, 8),    # Multi-scale factors
-    attention=False             # Optional attention
-)
-```
-
-### 2. Gaussian Diffusion
-
-Forward process (add noise):
-```
-x_t = √(α_t) x_0 + √(1 - α_t) ε
-```
-
-Reverse process (denoise):
-```
-x_{t-1} = μ_θ(x_t, t) + σ_t z
-```
-
-Noise schedules:
-- **Cosine**: Smoother noise curve (recommended)
-- **Linear**: Original DDPM schedule
-
-### 3. Dynamics-Aware Projection
-
-For linear system `x_{t+1} = Ax_t + Bu_t`:
-
-**Build trajectory matrix F:**
-```
-τ = [x_0, x_1, ..., x_T, u_0, u_1, ..., u_{T-1}]
-τ = F · [x_0, u_0, u_1, ..., u_{T-1}]
-```
-
-Where:
-- **F = [A_bar, C_T; 0, I]**
-- **A_bar** = Free response [I; A; A²; ...; A^T]
-- **C_T** = Forced response (controllability-like)
-
-**Projection matrix:**
-```
-P = F · F†  (pseudoinverse)
-```
-
-**Dynamics-aware sampling (Algorithm 1):**
-```
-for i = L → 1:
-    # Standard denoising
-    τ̂_{i-1} = μ_θ(τ'_i, i) + √β_i ε_i
-    
-    # Project onto feasible space
-    τ'_{i-1} = (√(1-β_{i-1}) P + √β_{i-1} I) · τ̂_{i-1}
-```
-
-Key properties:
-- ✅ Final trajectory τ'_0 satisfies dynamics (Lemma 1)
-- ✅ Recovers LQR controllers for optimal control (Theorem 2)
-- ✅ No retraining required
-
-### 4. Supported Dynamics
-
-| Environment | Dynamics Type | Method |
-|------------|---------------|---------|
-| PointMaze | Double integrator | Analytical |
-| HalfCheetah | Nonlinear | Numerical linearization |
-| Hopper | Nonlinear | Numerical linearization |
-| AdroitHand | Nonlinear | Numerical linearization |
-
-**Analytical (PointMaze):**
-```python
-# State: [x, y, vx, vy]
-# Action: [ax, ay]
-A = [[1, 0, dt, 0],
-     [0, 1, 0, dt],
-     [0, 0, 1, 0],
-     [0, 0, 0, 1]]
-
-B = [[0.5*dt², 0],
-     [0, 0.5*dt²],
-     [dt, 0],
-     [0, dt]]
-```
-
-**Numerical (Complex Systems):**
-- Linearize around operating point via finite differences
-- Compute Jacobians ∂f/∂x (A) and ∂f/∂u (B)
-
----
-
-## 💡 Usage Examples
+## Usage Examples
 
 ### Example 1: Train and Evaluate on PointMaze
 ```bash
@@ -642,59 +489,10 @@ policy = DynamicsAwarePolicy(
 action = policy.get_action(observation)
 ```
 
----
 
-## 📈 Expected Results
+## Citation
 
-### PointMaze UMaze
-
-| Method | Mean Reward | Success Rate | Trajectory Feasibility |
-|--------|-------------|--------------|----------------------|
-| Vanilla Diffusion | -12.5 ± 2.3 | 65% | 75% |
-| Dynamics-Aware | **-10.2 ± 1.8** | **80%** | **98%** |
-
-**Improvement:** ~18% better rewards, 15% higher success rate
-
-### HalfCheetah Medium
-
-| Method | Mean Reward | Episode Length |
-|--------|-------------|---------------|
-| Vanilla Diffusion | 42.0 ± 3.5 | 1000 |
-| Dynamics-Aware | **44.5 ± 2.8** | 1000 |
-
-**Improvement:** ~6% better rewards, more stable
-
----
-
-## 🔧 Differences from Original Diffuser
-
-| Original Diffuser | This Implementation |
-|------------------|---------------------|
-| gym | gymnasium |
-| D4RL | Minari |
-| mujoco-py | mujoco |
-| JAX/TF examples | Pure PyTorch |
-| Linux-focused | Cross-platform |
-| - | **🆕 Dynamics-aware projection** |
-
-**Architecture credit:** Temporal U-Net structure from Janner et al. (2022)
-
----
-
-## 📚 Citation
-
-### Original Diffuser Paper
-```bibtex
-@inproceedings{janner2022diffuser,
-  title={Planning with Diffusion for Flexible Behavior Synthesis},
-  author={Janner, Michael and Du, Yilun and Tenenbaum, Joshua and Levine, Sergey},
-  booktitle={International Conference on Machine Learning (ICML)},
-  year={2022}
-}
 ```
-
-### Dynamics-Aware Extension
-```bibtex
 @article{gadginmath2025dynamics,
   title={Dynamics-aware Diffusion Models for Planning and Control},
   author={Gadginmath, Darshan and Pasqualetti, Fabio},
@@ -703,25 +501,13 @@ action = policy.get_action(observation)
 }
 ```
 
----
-
-## 🤝 Contributing
-
-Contributions welcome! Areas of interest:
-- Additional environments and dynamics models
-- DDIM sampling for faster inference
-- Nonlinear dynamics extensions
-- CBF-based safety constraints
-
----
-
-## 📄 License
+##  License
 
 MIT License - see LICENSE file for details.
 
 ---
 
-## 🔗 Resources
+##  Resources
 
 - **Original Diffuser**: [https://diffusion-planning.github.io/](https://diffusion-planning.github.io/)
 - **Original Code**: [https://github.com/jannerm/diffuser](https://github.com/jannerm/diffuser)
@@ -731,7 +517,7 @@ MIT License - see LICENSE file for details.
 
 ---
 
-## 🙏 Acknowledgments
+##  Acknowledgments
 
 - **Temporal U-Net architecture** adapted from Janner et al. (2022)
 - **Dynamics-aware projection** based on Gadginmath & Pasqualetti (2025)
