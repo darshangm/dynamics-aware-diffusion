@@ -1,5 +1,6 @@
 # Dynamics-aware Diffusion Models for Planning and Control
 
+## Based on the paper 'Dynamics-aware Diffusion Models for Planning and Control', Darshan Gadginmath, Fabio Pasqualetti, Conference on Decision and Control, December 2025, Rio de Janeiro
 
 ## Repository based on
  **Planning with Diffusion for Flexible Behavior Synthesis**  
