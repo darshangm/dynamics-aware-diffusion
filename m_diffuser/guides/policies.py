@@ -6,7 +6,7 @@ Implements conditioning and reward-weighted trajectory optimization.
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Optional, Callable, Dict
+from typing import Optional, Callable, Dict, Any
 from tqdm import tqdm
 
 
@@ -154,7 +154,18 @@ class GuidedPolicy(nn.Module):
             if 'observation' in observation and 'desired_goal' in observation:
                 obs_state = observation['observation']
                 obs_goal = observation['desired_goal']
-                observation = np.concatenate([obs_state, obs_goal])
+                
+                # Check what dimension the model expects
+                expected_dim = self.normalizer.obs_mean.shape[0]
+                state_dim = len(obs_state)
+                goal_dim = len(obs_goal)
+                
+                if expected_dim == state_dim + goal_dim:
+                    # Model was trained with goal-conditioned observations
+                    observation = np.concatenate([obs_state, obs_goal])
+                else:
+                    # Model was trained with state-only observations (no goal)
+                    observation = obs_state
             elif 'observation' in observation:
                 observation = observation['observation']
             elif 'achieved_goal' in observation:
@@ -174,7 +185,7 @@ class GuidedPolicy(nn.Module):
         action_end = action_start + self.action_dim
         
         # Extract next action_horizon actions (skip timestep 0 which is conditioned)
-        for t in range(1, min(self.action_horizon + 1, self.horizon)):
+        for t in range(0, min(self.action_horizon + 1, self.horizon)):
             normed_action = trajectory_np[t, action_start:action_end]
             action = self.normalizer.unnormalize_actions(normed_action.reshape(1, -1))
             self.action_buffer.append(action.flatten())
@@ -262,196 +273,299 @@ class ValueGuidedPolicy(GuidedPolicy):
 
 class DynamicsAwarePolicy(GuidedPolicy):
     """
-    Dynamics-aware diffusion policy using projection-based sampling.
-    Can also use action buffering (MPC-style) via action_horizon parameter.
-    
-    Handles conversion between interleaved format (used by diffusion model)
-    and concatenated format (required by projection matrix).
+    Policy that generates trajectories respecting system dynamics.
+    Uses projection during sampling to enforce dynamics constraints.
     """
     
     def __init__(self,
-                 diffusion_model,
-                 normalizer,
-                 projection_matrix: torch.Tensor,
-                 state_dim: int,
-                 action_dim: int,
-                 action_horizon: Optional[int] = None):
+                diffusion_model,
+                projection_matrix: Optional[torch.Tensor] = None,
+                normalizer=None,
+                state_dim: int = 4,
+                observation_dim: int = 4,
+                action_dim: int = 2,
+                horizon: int = 16,
+                projection_schedule: str = 'constant',
+                projection_strength: float = 1.0,
+                action_horizon: Optional[int] = None):
         """
         Args:
-            diffusion_model: GaussianDiffusion model
-            normalizer: DatasetNormalizer for denormalization
-            projection_matrix: P = FF† matrix for concatenated format
-            state_dim: State dimension (from dynamics, not observation_dim)
-            action_dim: Action dimension
-            action_horizon: How many actions to use before replanning (None = use all)
+            diffusion_model: Trained diffusion model
+            projection_matrix: Dynamics projection matrix P
+            normalizer: Dataset normalizer for unnormalization
+            state_dim: Physical state dimension (4 for PointMaze)
+            observation_dim: Observation dimension (4 for PointMaze without goals)
+            action_dim: Action dimension (2 for PointMaze)
+            horizon: Planning horizon (length of trajectory to generate)
+            projection_schedule: 'constant', 'linear', or 'quadratic'
+            projection_strength: Maximum projection strength (0-1)
+            action_horizon: How many actions to execute before replanning (default: horizon)
         """
-        # If action_horizon not specified, use full horizon (most efficient)
+        # Use horizon as default action_horizon for MPC behavior
         if action_horizon is None:
-            action_horizon = diffusion_model.horizon
+            action_horizon = horizon
         
-        super().__init__(diffusion_model, normalizer, action_horizon=action_horizon)
+        # Initialize parent class with CORRECT parameters
+        super().__init__(
+            diffusion_model=diffusion_model,
+            normalizer=normalizer,
+            guide_fn=None,
+            guide_weight=0.0,
+            action_horizon=action_horizon  # ← CRITICAL for MPC!
+        )
         
-        self.P = projection_matrix.to(diffusion_model.betas.device)
+        # Store projection and dynamics info
+        self.projection_matrix = projection_matrix
         self.state_dim = state_dim
-        self.action_dim_actual = action_dim
+        self.observation_dim = observation_dim
+        self.action_dim = action_dim
+        self.horizon = horizon
+        self.projection_schedule = projection_schedule
+        self.projection_strength = projection_strength
         
-        print(f"DynamicsAwarePolicy: action_horizon={self.action_horizon}")
-        print(f"  Projection matrix shape: {self.P.shape}")
-        print(f"  Will replan every {self.action_horizon} steps")
+        # Store n_timesteps for projection schedule
+        self.n_timesteps = diffusion_model.n_timesteps  # ← FIX: Add this!
         
-        # Validate dimensions
-        expected_size = (self.horizon + 1) * state_dim + self.horizon * action_dim
-        if self.P.shape[0] != expected_size:
-            print(f"Warning: Projection matrix size {self.P.shape[0]} doesn't match "
-                  f"expected size {expected_size}")
-            print(f"  Horizon: {self.horizon}, State dim: {state_dim}, Action dim: {action_dim}")
-    
-    def interleaved_to_concatenated(self, trajectory: torch.Tensor) -> torch.Tensor:
-        """
-        Convert from interleaved to concatenated format for projection.
+        # Get device from model
+        self.device = next(diffusion_model.parameters()).device  # ← FIX: Add this!
         
-        Input format (from diffusion model):
-            trajectory[t] = [obs(t), action(t)] for t in [0, horizon-1]
-            Shape: (batch, horizon, obs_dim + action_dim)
-        
-        Output format (for projection matrix):
-            [obs(0), obs(1), ..., obs(T), action(0), action(1), ..., action(T-1)]
-            Shape: (batch, (horizon+1)*state_dim + horizon*action_dim)
-        """
-        batch_size, horizon, transition_dim = trajectory.shape
-        
-        # Extract observations and actions from interleaved format
-        observations = trajectory[:, :, :self.observation_dim]
-        actions = trajectory[:, :, self.observation_dim:]
-        
-        # For dynamics projection, we need the actual state, not full observation
-        states = observations[:, :, :self.state_dim]
-        
-        # We need T+1 states but only have T states in trajectory
-        # Duplicate last state as approximation
-        last_state = states[:, -1:, :]
-        states_extended = torch.cat([states, last_state], dim=1)
-        
-        # Flatten: concatenate all states, then all actions
-        states_flat = states_extended.reshape(batch_size, -1)
-        actions_flat = actions.reshape(batch_size, -1)
-        
-        # Concatenated format
-        concatenated = torch.cat([states_flat, actions_flat], dim=1)
-        return concatenated
-    
-    def concatenated_to_interleaved(self, concatenated: torch.Tensor, horizon: int) -> torch.Tensor:
-        """
-        Convert from concatenated format back to interleaved format.
-        
-        Input format (from projection):
-            [obs(0), obs(1), ..., obs(T), action(0), action(1), ..., action(T-1)]
-        
-        Output format (for diffusion model):
-            trajectory[t] = [obs(t), action(t)]
-        """
-        batch_size = concatenated.shape[0]
-        
-        # Split into states and actions
-        n_states_total = (horizon + 1) * self.state_dim
-        states_flat = concatenated[:, :n_states_total]
-        actions_flat = concatenated[:, n_states_total:]
-        
-        # Reshape
-        states = states_flat.reshape(batch_size, horizon + 1, self.state_dim)
-        actions = actions_flat.reshape(batch_size, horizon, self.action_dim_actual)
-        
-        # Drop the last state (we only need T states for T timesteps)
-        states = states[:, :-1, :]
-        
-        # Pad state to observation_dim if needed (e.g., add goal back)
-        if self.state_dim < self.observation_dim:
-            obs_padding = torch.zeros(
-                batch_size, horizon, self.observation_dim - self.state_dim,
-                device=states.device
-            )
-            observations = torch.cat([states, obs_padding], dim=-1)
+        # Store normalization statistics as tensors if normalizer provided
+        if normalizer is not None:
+            self.obs_mean = torch.from_numpy(normalizer.obs_mean).float().to(self.device)
+            self.obs_std = torch.from_numpy(normalizer.obs_std).float().to(self.device)
+            self.action_mean = torch.from_numpy(normalizer.action_mean).float().to(self.device)
+            self.action_std = torch.from_numpy(normalizer.action_std).float().to(self.device)
+            print(f"DynamicsAwarePolicy: Normalizer loaded")
+            print(f"  obs_mean shape: {self.obs_mean.shape}")
+            print(f"  action_mean shape: {self.action_mean.shape}")
         else:
-            observations = states
+            self.obs_mean = None
+            self.obs_std = None
+            self.action_mean = None
+            self.action_std = None
+            print(f"DynamicsAwarePolicy: No normalizer provided")
         
-        # Pad action to action_dim if needed
-        if self.action_dim_actual < self.action_dim:
-            action_padding = torch.zeros(
-                batch_size, horizon, self.action_dim - self.action_dim_actual,
-                device=actions.device
-            )
-            actions = torch.cat([actions, action_padding], dim=-1)
-        
-        # Interleave: [obs, action] at each timestep
-        trajectory = torch.cat([observations, actions], dim=-1)
-        
-        return trajectory
+        if projection_matrix is not None:
+            print(f"DynamicsAwarePolicy initialized with dynamics projection")
+            print(f"  Planning horizon: {horizon}")
+            print(f"  Action horizon (MPC): {action_horizon}")
+            print(f"  Projection schedule: {projection_schedule}")
+            print(f"  Projection strength: {projection_strength}")
+            print(f"  Projection matrix shape: {projection_matrix.shape}")
+        else:
+            print(f"DynamicsAwarePolicy: No projection matrix (vanilla sampling)")
     
-    @torch.no_grad()
-    def p_sample_with_projection(self, x: torch.Tensor, t: torch.Tensor, i: int,
-                                 conditions: Optional[Dict[int, torch.Tensor]] = None) -> torch.Tensor:
+    def _get_projection_alpha(self, t: int) -> float:
         """
-        Sample with dynamics-aware projection (Algorithm 1, steps 3-4).
+        Get projection strength at timestep t based on schedule.
         """
+        # Normalize timestep to [0, 1]
+        progress = t / self.n_timesteps
+        
+        if self.projection_schedule == 'constant':
+            alpha = self.projection_strength
+        
+        elif self.projection_schedule == 'linear':
+            alpha = self.projection_strength * (1 - progress)
+        
+        elif self.projection_schedule == 'quadratic':
+            alpha = self.projection_strength * (1 - progress) ** 2
+        
+        elif self.projection_schedule == 'noise_schedule':
+            # Match paper: use √(1-β_t) directly
+            # Need to get β_t from diffusion model
+            beta_t = self.diffusion.betas[t] if hasattr(self, 'diffusion') else 0.0
+            alpha = torch.sqrt(1 - beta_t).item() * self.projection_strength
+        
+        else:
+            raise ValueError(f"Unknown projection schedule: {self.projection_schedule}")
+        
+        return alpha
+    
+    def unnormalize_states(self, states_norm: torch.Tensor) -> torch.Tensor:
+        """Unnormalize states to physical space."""
+        if self.obs_mean is None:
+            return states_norm
+        return states_norm * self.obs_std + self.obs_mean
+    
+    def unnormalize_actions(self, actions_norm: torch.Tensor) -> torch.Tensor:
+        """Unnormalize actions to physical space."""
+        if self.action_mean is None:
+            return actions_norm
+        return actions_norm * self.action_std + self.action_mean
+    
+    def normalize_states(self, states_physical: torch.Tensor) -> torch.Tensor:
+        """Normalize states from physical space."""
+        if self.obs_mean is None:
+            return states_physical
+        return (states_physical - self.obs_mean) / self.obs_std
+    
+    def normalize_actions(self, actions_physical: torch.Tensor) -> torch.Tensor:
+        """Normalize actions from physical space."""
+        if self.action_mean is None:
+            return actions_physical
+        return (actions_physical - self.action_mean) / self.action_std
+    
+    def apply_projection(self, x: torch.Tensor, t: int) -> torch.Tensor:
+        """
+        Apply dynamics projection with noise schedule alignment.
+        
+        CRITICAL: Projects in PHYSICAL (unnormalized) space!
+        
+        Args:
+            x: Trajectory in normalized interleaved format (batch, horizon, obs_dim + action_dim)
+            t: Current diffusion timestep
+        
+        Returns:
+            x_projected: Projected trajectory in normalized interleaved format
+        """
+        if self.projection_matrix is None or self.normalizer is None:
+            return x
+        
+        # Get projection strength based on noise level
+        alpha = self._get_projection_alpha(t)
+        
+        if alpha <= 0:
+            return x  # No projection at this timestep
+        
         batch_size = x.shape[0]
         
-        # Step 3: Predict using neural network
-        model_mean, model_log_variance = self.diffusion.p_mean_variance(x, t)
+        # Extract states and actions (NORMALIZED)
+        observations_norm = x[:, :, :self.observation_dim]
+        actions_norm = x[:, :, self.observation_dim:]
+        states_norm = observations_norm[:, :, :self.state_dim]
         
-        noise = torch.randn_like(x)
-        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
+        # UNNORMALIZE to physical space
+        states_physical = self.unnormalize_states(states_norm)
+        actions_physical = self.unnormalize_actions(actions_norm)
         
-        tau_hat = model_mean + nonzero_mask * torch.exp(0.5 * model_log_variance) * noise
+        # Add final state for concatenation
+        states_physical_extended = torch.cat([states_physical, states_physical[:, -1:, :]], dim=1)
         
-        if conditions is not None:
-            tau_hat = self.apply_conditions(tau_hat, conditions)
+        # Flatten to concatenated format (PHYSICAL space)
+        states_flat = states_physical_extended.reshape(batch_size, -1)
+        actions_flat = actions_physical.reshape(batch_size, -1)
+        x_concat_physical = torch.cat([states_flat, actions_flat], dim=1)
         
-        # Step 4: Project onto feasible trajectory space
-        if i > 0:
-            beta_prev = self.diffusion.betas[i - 1]
-            proj_weight = torch.sqrt(1 - beta_prev)
-            noise_weight = torch.sqrt(beta_prev)
-            
-            tau_hat_concat = self.interleaved_to_concatenated(tau_hat)
-            # Optimized: Use @ P.T instead of (P @ .T).T
-            tau_proj_concat = proj_weight * torch.mm(tau_hat_concat, self.P.T) + noise_weight * tau_hat_concat
-            tau_prime = self.concatenated_to_interleaved(tau_proj_concat, self.horizon)
+        # Project in PHYSICAL space
+        x_projected_physical = x_concat_physical @ self.projection_matrix
+        
+        # Blend with annealing (in physical space)
+        x_concat_physical = alpha * x_projected_physical + (1 - alpha) * x_concat_physical
+        
+        # Split back
+        states_size = (self.horizon + 1) * self.state_dim
+        states_flat = x_concat_physical[:, :states_size]
+        actions_flat = x_concat_physical[:, states_size:]
+        
+        states_physical = states_flat.reshape(batch_size, self.horizon + 1, self.state_dim)
+        actions_physical = actions_flat.reshape(batch_size, self.horizon, self.action_dim)
+        
+        # Remove final state
+        states_physical = states_physical[:, :-1, :]
+        
+        # NORMALIZE back to normalized space for diffusion model
+        states_norm = self.normalize_states(states_physical)
+        actions_norm = self.normalize_actions(actions_physical)
+        
+        # Reconstruct observations
+        # Since observation_dim == state_dim (no goals), just use states
+        if self.observation_dim == self.state_dim:
+            observations_norm = states_norm
         else:
-            # Final step (i=0): Full projection
-            tau_hat_concat = self.interleaved_to_concatenated(tau_hat)
-            tau_proj_concat = torch.mm(tau_hat_concat, self.P.T)
-            tau_prime = self.concatenated_to_interleaved(tau_proj_concat, self.horizon)
+            # If there's padding needed (shouldn't happen with no goals)
+            padding = torch.zeros(batch_size, self.horizon,
+                                self.observation_dim - self.state_dim,
+                                device=states_norm.device)
+            observations_norm = torch.cat([states_norm, padding], dim=-1)
         
-        if conditions is not None:
-            tau_prime = self.apply_conditions(tau_prime, conditions)
+        # Return in normalized interleaved format
+        x_projected = torch.cat([observations_norm, actions_norm], dim=-1)
         
-        return tau_prime
+        return x_projected
+
+def test_dynamics_aware_policy():
+    """Test the dynamics-aware policy with PointMaze-like dimensions."""
+    print("\n" + "="*60)
+    print("Testing DynamicsAwarePolicy")
+    print("="*60)
     
-    @torch.no_grad()
-    def sample_loop(self, batch_size: int = 1, conditions: Optional[Dict[int, torch.Tensor]] = None,
-                   verbose: bool = False) -> torch.Tensor:
-        """
-        Dynamics-aware sampling loop (Algorithm 1).
-        Override sample_loop to use projection-based sampling.
-        """
-        device = self.diffusion.betas.device
-        shape = (batch_size, self.horizon, self.transition_dim)
-        
-        tau_prime = torch.randn(shape, device=device)
-        
-        if conditions is not None:
-            tau_prime = self.apply_conditions(tau_prime, conditions)
-        
-        timesteps = list(reversed(range(self.diffusion.n_timesteps)))
-        
-        if verbose:
-            timesteps = tqdm(timesteps, desc='Dynamics-aware Planning')
-        
-        for i in timesteps:
-            t = torch.full((batch_size,), i, device=device, dtype=torch.long)
-            tau_prime = self.p_sample_with_projection(tau_prime, t, i, conditions)
-        
-        return tau_prime
+    # PointMaze dimensions
+    state_dim = 4  # [x, y, vx, vy]
+    goal_dim = 2   # [goal_x, goal_y]
+    obs_dim = state_dim + goal_dim  # 6D total observation
+    action_dim = 2  # [ax, ay]
+    horizon = 8
+    
+    # Create dummy models
+    from m_diffuser.models.temporal_unet import TemporalUnet
+    from m_diffuser.models.diffusion import GaussianDiffusion
+    from m_diffuser.datasets.normalization import DatasetNormalizer
+    
+    # Dummy data for normalizer
+    dummy_obs = np.random.randn(1000, obs_dim)
+    dummy_actions = np.random.randn(1000, action_dim)
+    normalizer = DatasetNormalizer(dummy_obs, dummy_actions, obs_dim, action_dim)
+    
+    # Create diffusion model
+    unet = TemporalUnet(
+        transition_dim=obs_dim + action_dim,
+        dim=64,
+        dim_mults=(1, 2, 4)
+    )
+    
+    diffusion = GaussianDiffusion(
+        model=unet,
+        horizon=horizon,
+        observation_dim=obs_dim,
+        action_dim=action_dim,
+        n_timesteps=100
+    )
+    
+    # Create projection matrix (double integrator)
+    dt = 0.01
+    A = np.array([
+        [1, 0, dt, 0],
+        [0, 1, 0, dt],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1]
+    ])
+    B = np.array([
+        [0.5*dt**2, 0],
+        [0, 0.5*dt**2],
+        [dt, 0],
+        [0, dt]
+    ])
+    
+    from m_diffuser.dynamics.projection import ProjectionMatrixBuilder
+    builder = ProjectionMatrixBuilder(A, B, state_dim, action_dim)
+    P = builder.get_projection_matrix(horizon)
+    
+    # Create policy
+    policy = DynamicsAwarePolicy(
+        diffusion_model=diffusion,
+        normalizer=normalizer,
+        projection_matrix=P,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        action_horizon=4
+    )
+    
+    # Test with goal-conditioned observation
+    test_obs = {
+        'observation': np.array([0.0, 0.0, 0.0, 0.0]),  # state
+        'desired_goal': np.array([1.0, 1.0])  # goal
+    }
+    
+    print("\nTesting action generation...")
+    action = policy.get_action(test_obs)
+    
+    print(f"✓ Generated action shape: {action.shape}")
+    print(f"✓ Action: {action}")
+    
+    print("\n" + "="*60)
+    print("✓ All tests passed!")
+    print("="*60)
 
 
 def test_policy():
@@ -495,3 +609,4 @@ def test_policy():
 
 if __name__ == "__main__":
     test_policy()
+    # test_dynamics_aware_policy()

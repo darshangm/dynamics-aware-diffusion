@@ -295,6 +295,212 @@ class NumericalDynamicsExtractor(DynamicsExtractor):
         
         return B
 
+class TrajectoryDynamicsExtractor(DynamicsExtractor):
+    """
+    Extract dynamics by fitting to trajectory data.
+    Uses least-squares: min ||X_next - [A B] * [X; U]||^2
+    """
+    
+    def get_dynamics(self, 
+                     num_trajectories: int = 1000,
+                     trajectory_length: int = 80,
+                     use_dataset: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Fit (A, B) matrices from trajectory data.
+        
+        Args:
+            num_trajectories: Number of trajectories to collect
+            trajectory_length: Length of each trajectory
+            use_dataset: Optional path to existing dataset (e.g., D4RL dataset)
+        
+        Returns:
+            A, B: Fitted dynamics matrices
+        """
+        if use_dataset is not None:
+            # Load from existing dataset (D4RL, Minari, etc.)
+            states, actions, next_states = self._load_dataset(use_dataset)
+        else:
+            # Collect new trajectories
+            states, actions, next_states = self._collect_trajectories(
+                num_trajectories, trajectory_length
+            )
+        
+        # Fit dynamics using least squares
+        A, B = self._fit_linear_dynamics(states, actions, next_states)
+        
+        return A, B
+    
+    def _collect_trajectories(self, 
+                            num_traj: int, 
+                            traj_len: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Collect trajectory data from environment.
+        
+        Returns:
+            states: (N, state_dim)
+            actions: (N, action_dim)
+            next_states: (N, state_dim)
+        """
+        all_states = []
+        all_actions = []
+        all_next_states = []
+        
+        print(f"Collecting {num_traj} trajectories of length {traj_len}...")
+        
+        for traj_idx in range(num_traj):
+            obs, _ = self.env.reset()
+            state = self._extract_state(obs)
+            
+            for step in range(traj_len):
+                # Random action (or could use a policy)
+                action = self.env.action_space.sample()
+                
+                # Step environment
+                next_obs, _, terminated, truncated, _ = self.env.step(action)
+                next_state = self._extract_state(next_obs)
+                
+                # Store transition
+                all_states.append(state)
+                all_actions.append(action)
+                all_next_states.append(next_state)
+                
+                # Update state
+                state = next_state
+                
+                if terminated or truncated:
+                    break
+            
+            if (traj_idx + 1) % 10 == 0:
+                print(f"  Collected {traj_idx + 1}/{num_traj} trajectories")
+        
+        states = np.array(all_states)
+        actions = np.array(all_actions)
+        next_states = np.array(all_next_states)
+        
+        print(f"Collected {len(states)} transitions")
+        
+        return states, actions, next_states
+    
+    def _load_dataset(self, dataset_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Load trajectory data from existing dataset.
+        
+        For D4RL/Minari datasets.
+        """
+        try:
+            import minari
+            dataset = minari.load_dataset(dataset_path)
+            
+            all_states = []
+            all_actions = []
+            all_next_states = []
+            
+            print(f"Loading dataset: {dataset_path}")
+            
+            for episode_idx, episode in enumerate(dataset):
+                observations = episode.observations
+                actions = episode.actions
+                
+                # Handle dict observations (PointMaze)
+                if isinstance(observations, dict):
+                    if 'observation' in observations:
+                        # Extract state trajectory (T+1, state_dim)
+                        obs_array = observations['observation']
+                    else:
+                        print(f"Warning: Skipping episode {episode_idx} - unknown dict structure")
+                        continue
+                else:
+                    obs_array = observations
+                
+                # Create transitions: (s_t, a_t, s_{t+1})
+                for t in range(len(actions)):
+                    state = obs_array[t]
+                    action = actions[t]
+                    next_state = obs_array[t + 1]
+                    
+                    all_states.append(state)
+                    all_actions.append(action)
+                    all_next_states.append(next_state)
+            
+            states = np.array(all_states)
+            actions = np.array(all_actions)
+            next_states = np.array(all_next_states)
+            
+            print(f"Loaded {len(states)} transitions from dataset")
+            
+            return states, actions, next_states
+            
+        except Exception as e:
+            print(f"Could not load dataset: {e}")
+            import traceback
+            traceback.print_exc()
+            print("Falling back to trajectory collection")
+            return self._collect_trajectories(num_traj=100, traj_len=50)
+        
+    def _fit_linear_dynamics(self, 
+                            states: np.ndarray,
+                            actions: np.ndarray, 
+                            next_states: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Fit linear dynamics using least squares.
+        
+        Model: x_{t+1} = A*x_t + B*u_t
+        
+        Solve: min ||X_next - [A B] * [X; U]^T||^2
+        
+        Args:
+            states: (N, state_dim)
+            actions: (N, action_dim)
+            next_states: (N, state_dim)
+        
+        Returns:
+            A: (state_dim, state_dim)
+            B: (state_dim, action_dim)
+        """
+        N = states.shape[0]
+        
+        # Construct regressor matrix: [X, U]
+        # Shape: (N, state_dim + action_dim)
+        X = np.hstack([states, actions])
+        
+        # Target: X_next
+        # Shape: (N, state_dim)
+        Y = next_states
+        
+        # Solve least squares: [A, B] = argmin ||Y - X @ [A, B]^T||^2
+        # This gives us [A, B]^T
+        # Shape: (state_dim + action_dim, state_dim)
+        AB_T = np.linalg.lstsq(X, Y, rcond=None)[0]
+        
+        # Split into A and B
+        A = AB_T[:self.state_dim, :].T  # (state_dim, state_dim)
+        B = AB_T[self.state_dim:, :].T   # (state_dim, action_dim)
+        
+        # Compute fit quality (R^2)
+        Y_pred = X @ AB_T
+        residuals = Y - Y_pred
+        ss_res = np.sum(residuals**2)
+        ss_tot = np.sum((Y - Y.mean(axis=0))**2)
+        r_squared = 1 - (ss_res / ss_tot)
+        
+        print(f"\nLeast squares fit:")
+        print(f"  R^2 = {r_squared:.6f}")
+        print(f"  Mean prediction error = {np.mean(np.linalg.norm(residuals, axis=1)):.6f}")
+        print(f"  Max prediction error = {np.max(np.linalg.norm(residuals, axis=1)):.6f}")
+        
+        return A, B
+    
+    def _extract_state(self, obs):
+        """Extract state vector from observation."""
+        if isinstance(obs, dict):
+            if 'observation' in obs:
+                return obs['observation'].copy()
+            else:
+                raise ValueError("Cannot extract state from dict observation")
+        else:
+            return obs.copy()
+
+
 
 def get_dynamics_extractor(env_name: str, method: str = 'auto') -> DynamicsExtractor:
     """
@@ -302,7 +508,7 @@ def get_dynamics_extractor(env_name: str, method: str = 'auto') -> DynamicsExtra
     
     Args:
         env_name: Gymnasium environment name
-        method: 'analytical', 'numerical', or 'auto'
+        method: 'analytical', 'numerical', 'trajectory', or 'auto'
     
     Returns:
         DynamicsExtractor instance
@@ -310,13 +516,15 @@ def get_dynamics_extractor(env_name: str, method: str = 'auto') -> DynamicsExtra
     if method == 'auto':
         # Automatically choose based on environment
         if any(name in env_name.lower() for name in ['maze', 'pointmaze']):
-            method = 'analytical'
+            method = 'analytical'  # Analytical is fastest if available
         else:
-            method = 'numerical'
+            method = 'trajectory'  # Default to trajectory fitting
     
     if method == 'analytical':
         return AnalyticalDynamicsExtractor(env_name)
     elif method == 'numerical':
         return NumericalDynamicsExtractor(env_name)
+    elif method == 'trajectory':
+        return TrajectoryDynamicsExtractor(env_name)
     else:
         raise ValueError(f"Unknown method: {method}")

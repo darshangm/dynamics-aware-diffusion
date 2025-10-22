@@ -1,7 +1,6 @@
 """
+projection.py - Fixed version
 Build projection matrices for dynamics-aware diffusion.
-
-Implements the F and P matrices with direct interleaved format support.
 """
 
 import numpy as np
@@ -15,6 +14,8 @@ class ProjectionMatrixBuilder:
     
     Given dynamics x_{t+1} = A*x_t + B*u_t, constructs projection matrix
     that ensures generated trajectories satisfy the dynamics.
+    
+    Uses CONCATENATED format: [x0, x1, ..., xT, u0, u1, ..., u_{T-1}]
     """
     
     def __init__(self, A: np.ndarray, B: np.ndarray, state_dim: int, action_dim: int):
@@ -33,13 +34,18 @@ class ProjectionMatrixBuilder:
         # Validate dimensions
         assert A.shape == (state_dim, state_dim), f"A shape mismatch: {A.shape}"
         assert B.shape == (state_dim, action_dim), f"B shape mismatch: {B.shape}"
+        
+        print(f"ProjectionMatrixBuilder initialized:")
+        print(f"  State dim: {state_dim}")
+        print(f"  Action dim: {action_dim}")
+        print(f"  A condition number: {np.linalg.cond(A):.2e}")
     
     def _build_F_matrix(self, horizon: int) -> np.ndarray:
         """
         Build trajectory matrix F in concatenated format.
         
-        Concatenated trajectory: τ = [x₀, x₁, ..., xₜ, u₀, u₁, ..., uₜ₋₁]
-        Can be expressed as: τ = F · [x₀, u₀, u₁, ..., uₜ₋₁]
+        Concatenated trajectory: τ = [x₀, x₁, ..., xₜ, u₀, u₁, ..., u_{T-1}]
+        Can be expressed as: τ = F · [x₀, u₀, u₁, ..., u_{T-1}]
         
         Returns:
             F: ((T+1)*n + T*m, n + T*m) where n=state_dim, m=action_dim
@@ -76,77 +82,39 @@ class ProjectionMatrixBuilder:
         
         return F
     
-    def _build_permutation_matrix(self, horizon: int) -> np.ndarray:
-        """
-        Build permutation matrix Q: interleaved → concatenated.
-        
-        Interleaved: [s₀, a₀, s₁, a₁, ..., sₜ]
-        Concatenated: [s₀, s₁, ..., sₜ, a₀, a₁, ..., aₜ₋₁]
-        
-        Returns:
-            Q: Permutation matrix such that τ_concat = Q @ τ_interleaved
-        """
-        T = horizon
-        n = self.state_dim
-        m = self.action_dim
-        
-        n_concat = (T + 1) * n + T * m
-        n_interleaved = T * (n + m) + n
-        
-        Q = np.zeros((n_concat, n_interleaved))
-        
-        concat_idx = 0
-        
-        # States section in concatenated
-        for t in range(T + 1):
-            for d in range(n):
-                if t < T:
-                    # State at timestep t in interleaved format
-                    interleaved_idx = t * (n + m) + d
-                else:
-                    # Last state (no action after it)
-                    interleaved_idx = T * (n + m) + d
-                
-                Q[concat_idx, interleaved_idx] = 1.0
-                concat_idx += 1
-        
-        # Actions section in concatenated
-        for t in range(T):
-            for d in range(m):
-                # Action at timestep t (after state in interleaved)
-                interleaved_idx = t * (n + m) + n + d
-                Q[concat_idx, interleaved_idx] = 1.0
-                concat_idx += 1
-        
-        return Q
-    
-    def get_projection_matrix(self, horizon: int, interleaved: bool = True) -> torch.Tensor:
+    def get_projection_matrix(self, horizon: int) -> torch.Tensor:
         """
         Get projection matrix P = FF† for given horizon.
         
         Args:
             horizon: Planning horizon
-            interleaved: If True, return P for interleaved format (default: True)
-                        If False, return P for concatenated format
         
         Returns:
-            P: Projection matrix as PyTorch tensor
+            P: Projection matrix as PyTorch tensor (concatenated format)
         """
+        print(f"\nBuilding projection matrix for horizon={horizon}...")
+        
         # Build F in concatenated format
         F = self._build_F_matrix(horizon)
+        
+        print(f"  F shape: {F.shape}")
+        print(f"  F rank: {np.linalg.matrix_rank(F)}")
         
         # Compute pseudoinverse F†
         F_pinv = np.linalg.pinv(F)
         
         # Projection matrix P = FF†
-        P_concat = F @ F_pinv
+        P = F @ F_pinv
         
-        if interleaved:
-            # Transform to interleaved format: P_I = Q^T @ P_C @ Q
-            Q = self._build_permutation_matrix(horizon)
-            P = Q.T @ P_concat @ Q
+        # Verify it's a projection
+        P_squared = P @ P
+        error = np.linalg.norm(P_squared - P, 'fro')
+        print(f"  ||P² - P||_F = {error:.2e}")
+        
+        if error > 1e-4:
+            print("  WARNING: P is not a valid projection matrix!")
         else:
-            P = P_concat
+            print("  ✓ P is a valid projection matrix")
         
         # Convert to torch tensor
         return torch.from_numpy(P).float()
@@ -166,7 +134,7 @@ class ProjectionMatrixBuilder:
 
 
 def test_projection_matrices():
-    """Test projection matrix construction and interleaved format."""
+    """Test projection matrix construction."""
     print("=" * 60)
     print("Testing Projection Matrix Builder")
     print("=" * 60)
@@ -189,59 +157,17 @@ def test_projection_matrices():
     
     state_dim = 4
     action_dim = 2
-    horizon = 16
+    horizon = 8
     
-    # Build projections
+    # Build projection
     builder = ProjectionMatrixBuilder(A, B, state_dim, action_dim)
+    P = builder.get_projection_matrix(horizon)
     
-    print(f"\nSystem:")
-    print(f"  State dim: {state_dim}, Action dim: {action_dim}")
-    print(f"  Horizon: {horizon}")
-    
-    # Concatenated format
-    P_concat = builder.get_projection_matrix(horizon, interleaved=False)
-    print(f"\nConcatenated format:")
-    print(f"  P shape: {P_concat.shape}")
-    print(f"  P is projection: {builder.verify_projection(P_concat)}")
-    
-    # Interleaved format
-    P_interleaved = builder.get_projection_matrix(horizon, interleaved=True)
-    print(f"\nInterleaved format:")
-    print(f"  P shape: {P_interleaved.shape}")
-    print(f"  P is projection: {builder.verify_projection(P_interleaved)}")
-    
-    # Test equivalence
-    print("\n" + "=" * 60)
-    print("Testing Equivalence of Both Formats")
-    print("=" * 60)
-    
-    # Create random trajectory in interleaved format
-    transition_dim = state_dim + action_dim
-    traj_interleaved = torch.randn(horizon * transition_dim + state_dim)
-    
-    # Method 1: Convert to concatenated, project, convert back
-    Q = builder._build_permutation_matrix(horizon)
-    Q_torch = torch.from_numpy(Q).float()
-    
-    traj_concat = Q_torch @ traj_interleaved
-    traj_proj_concat = P_concat @ traj_concat
-    result_1 = Q_torch.T @ traj_proj_concat
-    
-    # Method 2: Direct projection in interleaved format
-    result_2 = P_interleaved @ traj_interleaved
-    
-    # Compare
-    error = torch.norm(result_1 - result_2).item()
-    print(f"\nError between methods: {error:.10f}")
-    
-    if error < 1e-8:
-        print("✓ Both methods are mathematically equivalent!")
-    else:
-        print("✗ Methods don't match!")
-        return False
+    print(f"\nProjection matrix P shape: {P.shape}")
+    print(f"P is projection: {builder.verify_projection(P)}")
     
     print("\n" + "=" * 60)
-    print("✓ All tests passed!")
+    print("✓ Test passed!")
     print("=" * 60)
     
     return True

@@ -1,9 +1,10 @@
 """
-Evaluation script for trained Diffuser models.
+Evaluation script for trained Diffuser models
 """
 
 import sys
 import json
+from typing import Optional, Tuple, Any
 from datetime import datetime
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -37,7 +38,7 @@ def parse_args():
     parser.add_argument('--policy-type', type=str, default='mpc',
                        choices=['guided', 'mpc','dynamics-aware'],
                        help='Policy type to use')
-    parser.add_argument('--action-horizon', type=int, default=8,
+    parser.add_argument('--action-horizon', type=int, default=16,
                        help='Action horizon for MPC policy')
     parser.add_argument('--device', type=str, default='cuda',
                        choices=['cuda', 'cpu'],
@@ -53,15 +54,78 @@ def parse_args():
                    help='Dataset name (if different from checkpoint config)')
     parser.add_argument('--seed', type=int, default=42,
                    help='Random seed')
-    parser.add_argument('--sampling-timesteps', type=int, default=100,
+    parser.add_argument('--sampling-timesteps', type=int, default=200,
                     help='Number of diffusion sampling steps (fewer = faster)')
     
     return parser.parse_args()
 
 
+
+def infer_model_config_from_checkpoint(checkpoint):
+    """
+    Infer model configuration from checkpoint weights.
+    More reliable than trusting saved config.
+    """
+    state_dict = checkpoint['model_state_dict']
+    
+    # Infer n_timesteps from beta shape
+    if 'betas' in state_dict:
+        n_timesteps = state_dict['betas'].shape[0]
+    else:
+        # Fallback, though 'betas' should always be there
+        n_timesteps = checkpoint.get('config', {}).get('n_timesteps', 200)
+    
+    # Infer dim_mults by counting encoder levels
+    max_down_idx = -1
+    for key in state_dict.keys():
+        if 'model.downs.' in key:
+            parts = key.split('.')
+            if len(parts) > 2 and parts[2].isdigit():
+                idx = int(parts[2])
+                max_down_idx = max(max_down_idx, idx)
+    
+    num_levels = max_down_idx + 1
+    
+    # Default dim_mults for different number of levels
+    if num_levels == 3:
+        dim_mults = (1, 2, 4)
+    elif num_levels == 4:
+        dim_mults = (1, 2, 4, 8)
+    elif num_levels == 2:
+        dim_mults = (1, 2)
+    elif num_levels == 0: # Fallback
+        dim_mults = (1, 2, 4, 8)
+    else:
+        dim_mults = tuple([2**i for i in range(num_levels)])
+    
+    # Infer base dim from first conv layer
+    dim = 128 # Default
+    for key in state_dict.keys():
+        if 'model.downs.0.0.blocks.0.block.0.weight' in key:
+            dim = state_dict[key].shape[0]
+            break
+    
+    # Get other configs from checkpoint if available
+    saved_config = checkpoint.get('config', {})
+    beta_schedule = saved_config.get('beta_schedule', 'cosine')
+    # Horizon must be loaded from the config saved *inside* the checkpoint
+    horizon = saved_config.get('horizon', 16) 
+    
+    config = {
+        'dim': dim,
+        'dim_mults': list(dim_mults),
+        'n_timesteps': n_timesteps,
+        'beta_schedule': beta_schedule,
+        'horizon': horizon,
+    }
+    
+    return config
+
+
 def load_model(checkpoint_path: str, dataset_name: str, device: str):
     """
     Load trained model from checkpoint.
+    FIXED VERSION: Handles checkpoints without dataset_config/model_config keys.
     
     Args:
         checkpoint_path: Path to checkpoint file
@@ -72,57 +136,69 @@ def load_model(checkpoint_path: str, dataset_name: str, device: str):
         (diffusion_model, normalizer)
     """
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # print(f"\nLoading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
-    # Load config (if available)
-    checkpoint_dir = Path(checkpoint_path).parent
-    config_path = checkpoint_dir / 'config.json'
+    # Check what keys are in the checkpoint
+    # print(f"Checkpoint keys: {list(checkpoint.keys())}")
     
-    if config_path.exists():
-        config = load_config(str(config_path))
-        print("Loaded config from checkpoint directory")
+    # Try to get config from checkpoint (may not exist in older checkpoints)
+    if 'config' in checkpoint:
+        print("✓ Found 'config' in checkpoint")
+        saved_config = checkpoint['config']
     else:
-        # Use default config
-        print("Warning: config.json not found, using defaults")
-        config = {
-            'dim': 128,
-            'dim_mults': [1, 2, 4, 8],
-            'n_timesteps': 1000,
-            'beta_schedule': 'cosine',
-            'horizon': 64,
-        }
+        print("⚠️  No 'config' key in checkpoint, will infer from weights")
+        saved_config = {}
     
-    # Load dataset for normalizer
-    print(f"Loading dataset: {dataset_name}")
+    # Infer model architecture from checkpoint weights
+    inferred_config = infer_model_config_from_checkpoint(checkpoint)
+    
+    # print(f"\n✓ Inferred model config:")
+    # print(f"  dim: {inferred_config['dim']}")
+    # print(f"  dim_mults: {tuple(inferred_config['dim_mults'])}")
+    # print(f"  n_timesteps: {inferred_config['n_timesteps']}")
+    # print(f"  beta_schedule: {inferred_config['beta_schedule']}")
+    # print(f"  horizon: {inferred_config['horizon']}")
+    
+    # Load dataset for normalizer AND to get dimensions
+    # print(f"\nLoading dataset: {dataset_name}")
     dataset = SequenceDataset(
         dataset_name=dataset_name,
-        horizon=config['horizon'],
+        horizon=inferred_config['horizon'],
+        normalizer='LimitsNormalizer',
+        max_path_length=1000,
+        use_padding=True
     )
     
-    # Create model
-    print("Creating model...")
+    # print(f"✓ Dataset loaded:")
+    # print(f"  observation_dim: {dataset.observation_dim}")
+    # print(f"  action_dim: {dataset.action_dim}")
+    # print(f"  transition_dim: {dataset.transition_dim}")
+    
+    # Create model using inferred config + dataset dimensions
+    # print("\nCreating model...")
+    
     unet = TemporalUnet(
         transition_dim=dataset.transition_dim,
-        dim=config['dim'],
-        dim_mults=tuple(config['dim_mults']),
+        dim=inferred_config['dim'],
+        dim_mults=tuple(inferred_config['dim_mults']),
     )
-
     
     diffusion = GaussianDiffusion(
         model=unet,
-        horizon=config['horizon'],
+        horizon=inferred_config['horizon'],
         observation_dim=dataset.observation_dim,
         action_dim=dataset.action_dim,
-        n_timesteps=config['n_timesteps'],
-        beta_schedule=config['beta_schedule'],
-    )
-
+        n_timesteps=inferred_config['n_timesteps'],
+        beta_schedule=inferred_config['beta_schedule']
+    ).to(device)
+    
     # Load weights
+    print("Loading model weights...")
     diffusion.load_state_dict(checkpoint['model_state_dict'])
-    diffusion.to(device)
     diffusion.eval()
     
-    print("Model loaded successfully!")
+    print("✓ Model loaded successfully!\n")
     
     return diffusion, dataset.normalizer
 
@@ -143,46 +219,25 @@ def evaluate_policy(policy, env, n_episodes: int, render: bool = False):
     episode_rewards = []
     episode_lengths = []
     
-    for episode in tqdm(range(n_episodes), desc='Evaluating'):
+    for episode in range(n_episodes):
         obs, info = env.reset()
         done = False
-        truncated = False
         episode_reward = 0
         episode_length = 0
         
-        # DEBUG: Print initial state
-        print(f"\n=== Episode {episode + 1} ===")
+        # DEBUG: Print start position and goal
         if isinstance(obs, dict):
-            print(f"Start position: {obs['observation'][:2]}")
-            print(f"Goal position: {obs['desired_goal']}")
-            start_pos = obs['observation'][:2].copy()
-            goal_pos = obs['desired_goal'].copy()
-            initial_distance = np.linalg.norm(start_pos - goal_pos)
-            print(f"Initial distance to goal: {initial_distance:.3f}")
-        else:
-            start_pos = None
-            goal_pos = None
+            start_pos = obs['observation'][:2]
+            goal_pos = obs['desired_goal']
+            print(f"\nEpisode {episode + 1}: start={start_pos}, goal={goal_pos}")
+            print(f"  Initial distance to goal: {np.linalg.norm(start_pos - goal_pos):.3f}")
         
-        while not (done or truncated):
+        while not done and episode_length < 1000:  # Max 1000 steps
             # Get action from policy
             action = policy.get_action(obs)
             
-            # DEBUG: Print first few actions
-            # if episode_length < 3:
-            #     print(f"Step {episode_length}: action={action}, magnitude={np.linalg.norm(action):.4f}")
-            
-            # Clip action to environment bounds
-            if hasattr(env.action_space, 'low'):
-                action = np.clip(action, env.action_space.low, env.action_space.high)
-            
             # Step environment
             obs, reward, done, truncated, info = env.step(action)
-            
-            # DEBUG: Print when reward received or first few steps
-            # if (reward > 0 or episode_length < 3) and isinstance(obs, dict):
-            #     curr_pos = obs['observation'][:2]
-            #     curr_distance = np.linalg.norm(curr_pos - goal_pos)
-            #     print(f"  After step: pos={curr_pos}, distance={curr_distance:.3f}, reward={reward}")
             
             episode_reward += reward
             episode_length += 1
@@ -288,51 +343,70 @@ def main():
         if dataset_name is None:
             print(f"Warning: No default dataset for {args.env}, using mujoco/halfcheetah/simple-v0")
             dataset_name = 'mujoco/halfcheetah/simple-v0'
+    
     # Load model
     diffusion, normalizer = load_model(args.checkpoint, dataset_name, args.device)
 
     # Override sampling timesteps for faster inference
+    original_timesteps = diffusion.n_timesteps
     diffusion.n_timesteps = args.sampling_timesteps
-    print(f"Using {args.sampling_timesteps} sampling timesteps for inference")
+    print(f"✓ Using {args.sampling_timesteps} sampling timesteps for inference (trained with {original_timesteps})")
     
     # Create policy
     if args.policy_type == 'guided':
         policy = GuidedPolicy(diffusion, normalizer)
+        print("✓ Created GuidedPolicy")
     elif args.policy_type == 'mpc':
         policy = MPCPolicy(diffusion, normalizer, action_horizon=args.action_horizon)
+        print(f"✓ Created MPCPolicy (action_horizon={args.action_horizon})")
     elif args.policy_type == 'dynamics-aware':
-        from m_diffuser.dynamics import get_dynamics_for_env, ProjectionMatrixBuilder
+        print("\n" + "="*60)
+        print("Creating DYNAMICS-AWARE policy")
+        print("="*60)
         
-        print("Extracting dynamics for environment...")
-        A, B, state_dim, action_dim_dynamics = get_dynamics_for_env(
-            args.env, dataset_name=dataset_name
+        # Extract dynamics matrices
+        from m_diffuser.dynamics.registry import get_dynamics_for_env
+        from m_diffuser.dynamics.projection import ProjectionMatrixBuilder
+        
+        print(f"Extracting dynamics for {args.env}...")
+        A, B, state_dim, action_dim = get_dynamics_for_env(
+            env_name=args.env,
+            dataset_name=dataset_name,
+            method='data_driven'
         )
         
-        print(f"Building projection matrix for horizon={diffusion.horizon}...")
-        proj_builder = ProjectionMatrixBuilder(A, B, state_dim, action_dim_dynamics)
-        P = proj_builder.get_projection_matrix(
-            diffusion.horizon,
-            interleaved=True  # ← Direct interleaved format!
-        )
+        print(f"✓ Dynamics extracted:")
+        print(f"  A shape: {A.shape}")
+        print(f"  B shape: {B.shape}")
+        print(f"  State dim: {state_dim}")
+        print(f"  Action dim: {action_dim}")
         
-        print(f"  Projection matrix P shape: {P.shape}")
-        print(f"  Format: interleaved (no conversion needed)")
+        # Build projection matrix
+        horizon = diffusion.horizon
+        print(f"\nBuilding projection matrix (horizon={horizon})...")
+        builder = ProjectionMatrixBuilder(A, B, state_dim, action_dim)
+        P = builder.get_projection_matrix(horizon)
         
+        # Create dynamics-aware policy
         policy = DynamicsAwarePolicy(
             diffusion_model=diffusion,
-            normalizer=normalizer,
             projection_matrix=P,
+            normalizer=normalizer,
             state_dim=state_dim,
-            action_dim=action_dim_dynamics,
+            observation_dim=diffusion.observation_dim,
+            action_dim=diffusion.action_dim,
+            horizon=horizon,
+            projection_schedule='noise_schedule',
+            projection_strength=1.0,
             action_horizon=args.action_horizon
         )
+        
+        print("✓ DynamicsAwarePolicy created successfully!")
+        print("="*60)
     else:
         raise ValueError(f"Unknown policy type: {args.policy_type}")
     
-    print(f"\nCreated {args.policy_type} policy")
-    
     # Create environment
-    
     if args.render == 'human':
         env = gym.make(args.env, render_mode='human')
     elif args.render == 'video':
@@ -343,14 +417,13 @@ def main():
     else:  # args.render == 'none'
         env = gym.make(args.env)
 
-    env.reset(seed=42)
-
-
-
-    print(f"Created environment: {args.env}")
+    env.reset(seed=args.seed)
+    print(f"✓ Created environment: {args.env}")
     
     # Evaluate
-    print(f"\nRunning {args.n_episodes} evaluation episodes...\n")
+    print(f"\n{'='*60}")
+    print(f"Running {args.n_episodes} evaluation episodes...")
+    print(f"{'='*60}\n")
     metrics = evaluate_policy(policy, env, args.n_episodes)
 
     results_file = save_results(metrics, args)

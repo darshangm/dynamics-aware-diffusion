@@ -63,231 +63,222 @@ class EMA:
 
 
 class Trainer:
-    """
-    Main trainer class for diffusion models.
-    Handles training loop, logging, and checkpointing.
-    """
+    """Updated Trainer class with custom loss function support."""
     
     def __init__(self,
-                 model: nn.Module,
-                 optimizer: Optimizer,
-                 train_loader: torch.utils.data.DataLoader,
-                 val_loader: Optional[torch.utils.data.DataLoader] = None,
-                 scheduler: Optional[_LRScheduler] = None,
-                 device: str = 'cuda',
-                 log_dir: str = './logs',
-                 save_freq: int = 10000,
-                 eval_freq: int = 5000,
-                 use_ema: bool = True,
-                 ema_decay: float = 0.995,
-                 gradient_clip: Optional[float] = 1.0):
-        """
-        Args:
-            model: Diffusion model to train
-            optimizer: Optimizer
-            train_loader: Training data loader
-            val_loader: Optional validation data loader
-            scheduler: Optional learning rate scheduler
-            device: Device to train on
-            log_dir: Directory for logs and checkpoints
-            save_freq: Steps between checkpoint saves
-            eval_freq: Steps between evaluations
-            use_ema: Whether to use EMA
-            ema_decay: EMA decay rate
-            gradient_clip: Gradient clipping value (None to disable)
-        """
-        self.model = model.to(device)
+                 model,
+                 optimizer,
+                 train_loader,
+                 scheduler=None,
+                 device='cuda',
+                 log_dir='./logs',
+                 save_freq=10000,
+                 eval_freq=5000,
+                 use_ema=True,
+                 ema_decay=0.995,
+                 gradient_clip=1.0,
+                 loss_fn=None,           # NEW: Custom loss function
+                 loss_names=None):       # NEW: Names for logging
+        
+        self.model = model
         self.optimizer = optimizer
         self.train_loader = train_loader
-        self.val_loader = val_loader
         self.scheduler = scheduler
         self.device = device
-        self.log_dir = Path(log_dir)
+        self.log_dir = log_dir
         self.save_freq = save_freq
         self.eval_freq = eval_freq
+        self.use_ema = use_ema
         self.gradient_clip = gradient_clip
         
+        # NEW: Custom loss function
+        self.loss_fn = loss_fn
+        self.loss_names = loss_names if loss_names else ['loss']
+        
+        # Move model to device
+        self.model.to(device)
+        
+        # EMA setup
+        if use_ema:
+            from copy import deepcopy
+            self.ema_model = deepcopy(model)
+            self.ema_decay = ema_decay
+        else:
+            self.ema_model = None
+        
+        self.global_step = 0
+        
         # Create log directory
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
         
-        # EMA
-        self.ema = EMA(model, decay=ema_decay) if use_ema else None
-        
-        # Training state
-        self.step = 0
-        self.epoch = 0
-        self.train_losses = []
-        self.val_losses = []
-        
-        # Metrics tracking
-        self.metrics = defaultdict(list)
+        # Setup logging
+        self.log_file = open(os.path.join(log_dir, 'training.log'), 'a')
     
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> float:
+    def compute_loss(self, batch):
         """
-        Single training step.
-        
-        Args:
-            batch: Batch of data
+        Compute loss for a batch.
         
         Returns:
-            Loss value
+            loss: Scalar tensor
+            loss_dict: Dictionary of loss components (for logging)
         """
-        self.model.train()
+        if self.loss_fn is None:
+            # Default: use model's built-in loss
+            loss = self.model.loss(batch['conditions'])
+            loss_dict = {'diffusion': loss.item()}
+        else:
+            # Use custom loss function
+            # Check if it returns tuple (composed loss) or scalar
+            loss_output = self.loss_fn(batch)
+            
+            if isinstance(loss_output, tuple):
+                # Composed loss returns (total_loss, loss_dict)
+                loss, loss_dict = loss_output
+            else:
+                # Single loss function
+                loss = loss_output
+                loss_dict = {self.loss_names[0]: loss.item()}
         
+        return loss, loss_dict
+    
+    def train_step(self, batch):
+        """Single training step."""
         # Move batch to device
-        conditions = batch['conditions'].to(self.device)
+        for key in batch:
+            if isinstance(batch[key], torch.Tensor):
+                batch[key] = batch[key].to(self.device)
         
         # Forward pass
-        loss = self.model(conditions)
+        loss, loss_dict = self.compute_loss(batch)
         
         # Backward pass
         self.optimizer.zero_grad()
         loss.backward()
         
         # Gradient clipping
-        if self.gradient_clip is not None:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+        if self.gradient_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), 
+                self.gradient_clip
+            )
         
+        # Optimizer step
         self.optimizer.step()
         
-        # Update EMA
-        if self.ema is not None:
-            self.ema.update()
+        # Scheduler step
+        if self.scheduler is not None:
+            self.scheduler.step()
         
-        return loss.item()
+        # EMA update
+        if self.ema_model is not None:
+            self.update_ema()
+        
+        self.global_step += 1
+        
+        return loss_dict
     
-    @torch.no_grad()
-    def eval_step(self) -> float:
-        """
-        Evaluation step.
-        
-        Returns:
-            Average validation loss
-        """
-        if self.val_loader is None:
-            return 0.0
-        
-        self.model.eval()
-        
-        # Apply EMA if available
-        if self.ema is not None:
-            self.ema.apply_shadow()
-        
-        losses = []
-        for batch in self.val_loader:
-            conditions = batch['conditions'].to(self.device)
-            loss = self.model(conditions)
-            losses.append(loss.item())
-        
-        # Restore original parameters
-        if self.ema is not None:
-            self.ema.restore()
-        
-        return np.mean(losses)
+    def update_ema(self):
+        """Update EMA model."""
+        with torch.no_grad():
+            for ema_param, param in zip(
+                self.ema_model.parameters(), 
+                self.model.parameters()
+            ):
+                ema_param.data.mul_(self.ema_decay).add_(
+                    param.data, alpha=1 - self.ema_decay
+                )
     
-    def train(self, n_epochs: int):
-        """
-        Main training loop.
-        
-        Args:
-            n_epochs: Number of epochs to train
-        """
-        print(f"Starting training for {n_epochs} epochs")
-        print(f"Device: {self.device}")
-        print(f"Log directory: {self.log_dir}")
-        
-        for epoch in range(n_epochs):
-            self.epoch = epoch
-            epoch_losses = []
-            
-            for batch_idx, batch in enumerate(self.train_loader):
-                # Training step
-                loss = self.train_step(batch)
-                epoch_losses.append(loss)
-                self.step += 1
-                
-                # Logging
-                if self.step % 100 == 0:
-                    avg_loss = np.mean(epoch_losses[-100:])
-                    print(f"Epoch {epoch} | Step {self.step} | Loss: {avg_loss:.4f}")
-                    self.metrics['train_loss'].append(avg_loss)
-                
-                # Evaluation
-                if self.step % self.eval_freq == 0:
-                    val_loss = self.eval_step()
-                    print(f"Step {self.step} | Val Loss: {val_loss:.4f}")
-                    self.metrics['val_loss'].append(val_loss)
-                
-                # Save checkpoint
-                if self.step % self.save_freq == 0:
-                    self.save_checkpoint(f'checkpoint_step_{self.step}.pt')
-            
-            # Update scheduler
-            if self.scheduler is not None:
-                self.scheduler.step()
-            
-            # End of epoch summary
-            avg_epoch_loss = np.mean(epoch_losses)
-            print(f"Epoch {epoch} completed | Avg Loss: {avg_epoch_loss:.4f}")
-            self.train_losses.append(avg_epoch_loss)
-        
-        # Final save
-        self.save_checkpoint('final_model.pt')
-        print("Training completed!")
-    
-    def save_checkpoint(self, filename: str):
-        """
-        Save model checkpoint.
-        
-        Args:
-            filename: Checkpoint filename
-        """
-        checkpoint_path = self.log_dir / filename
-        
+    def save_checkpoint(self, epoch, is_best=False):
+        """Save model checkpoint."""
         checkpoint = {
-            'step': self.step,
-            'epoch': self.epoch,
+            'epoch': epoch,
+            'global_step': self.global_step,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'train_losses': self.train_losses,
-            'val_losses': self.val_losses,
-            'metrics': dict(self.metrics),
+            'config': {
+                'horizon': self.model.horizon,
+                'observation_dim': self.model.observation_dim,
+                'action_dim': self.model.action_dim,
+                'n_timesteps': self.model.n_timesteps,
+                'beta_schedule': self.model.beta_schedule,
+            }
         }
         
-        if self.ema is not None:
-            checkpoint['ema_shadow'] = self.ema.shadow
+        if self.ema_model is not None:
+            checkpoint['ema_state_dict'] = self.ema_model.state_dict()
         
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
         
-        torch.save(checkpoint, checkpoint_path)
-        print(f"Checkpoint saved: {checkpoint_path}")
+        # Save checkpoint
+        save_path = os.path.join(
+            self.log_dir, 
+            f'checkpoint_step_{self.global_step}.pt'
+        )
+        torch.save(checkpoint, save_path)
+        
+        if is_best:
+            best_path = os.path.join(self.log_dir, 'checkpoint_best.pt')
+            torch.save(checkpoint, best_path)
+        
+        return save_path
     
-    def load_checkpoint(self, checkpoint_path: str):
-        """
-        Load model checkpoint.
+    def train(self, n_epochs, start_epoch=0):
+        """Main training loop."""
+        from tqdm import tqdm
         
-        Args:
-            checkpoint_path: Path to checkpoint file
-        """
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.model.train()
         
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.step = checkpoint['step']
-        self.epoch = checkpoint['epoch']
-        self.train_losses = checkpoint['train_losses']
-        self.val_losses = checkpoint['val_losses']
-        self.metrics = defaultdict(list, checkpoint['metrics'])
+        for epoch in range(start_epoch, start_epoch + n_epochs):
+            epoch_losses = {name: [] for name in self.loss_names}
+            
+            pbar = tqdm(
+                self.train_loader, 
+                desc=f'Epoch {epoch+1}/{start_epoch + n_epochs}'
+            )
+            
+            for batch in pbar:
+                loss_dict = self.train_step(batch)
+                
+                # Accumulate losses
+                for name in self.loss_names:
+                    if name in loss_dict:
+                        epoch_losses[name].append(loss_dict[name])
+                
+                # Update progress bar
+                pbar_dict = {
+                    name: f"{loss_dict.get(name, 0):.4f}" 
+                    for name in self.loss_names
+                }
+                pbar_dict['lr'] = f"{self.optimizer.param_groups[0]['lr']:.2e}"
+                pbar.set_postfix(pbar_dict)
+                
+                # Save checkpoint
+                if self.global_step % self.save_freq == 0:
+                    save_path = self.save_checkpoint(epoch)
+                    print(f"\n✓ Saved checkpoint: {save_path}")
+            
+            # Epoch summary
+            print(f"\nEpoch {epoch+1} Summary:")
+            for name in self.loss_names:
+                if epoch_losses[name]:
+                    avg_loss = sum(epoch_losses[name]) / len(epoch_losses[name])
+                    print(f"  {name.capitalize()} loss: {avg_loss:.4f}")
+                    
+                    # Log to file
+                    self.log_file.write(
+                        f"Epoch {epoch+1}, {name}: {avg_loss:.4f}\n"
+                    )
+            
+            self.log_file.flush()
         
-        if self.ema is not None and 'ema_shadow' in checkpoint:
-            self.ema.shadow = checkpoint['ema_shadow']
+        # Final checkpoint
+        final_path = self.save_checkpoint(start_epoch + n_epochs - 1)
+        print(f"\n✓ Final checkpoint saved: {final_path}")
         
-        if self.scheduler is not None and 'scheduler_state_dict' in checkpoint:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
-        print(f"Checkpoint loaded: {checkpoint_path}")
-        print(f"Resuming from step {self.step}, epoch {self.epoch}")
+        self.log_file.close()
+
+
 
 
 class CosineAnnealingWarmup(_LRScheduler):
@@ -346,3 +337,28 @@ def load_config(config_path: str) -> Dict[str, Any]:
     with open(config_path, 'r') as f:
         config = json.load(f)
     return config
+
+
+def create_trainer_with_custom_loss(model, optimizer, train_loader, scheduler,
+                                    device, log_dir, save_freq, eval_freq,
+                                    use_ema, ema_decay, gradient_clip,
+                                    loss_fn=None, loss_names=None):
+    """
+    Function to create trainer with custom loss.
+    Use this in train.py script.
+    """
+    return Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        scheduler=scheduler,
+        device=device,
+        log_dir=log_dir,
+        save_freq=save_freq,
+        eval_freq=eval_freq,
+        use_ema=use_ema,
+        ema_decay=ema_decay,
+        gradient_clip=gradient_clip,
+        loss_fn=loss_fn,
+        loss_names=loss_names
+    )

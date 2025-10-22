@@ -91,6 +91,7 @@ class GaussianDiffusion(nn.Module):
         self.n_timesteps = n_timesteps
         self.clip_denoised = clip_denoised
         self.predict_epsilon = predict_epsilon
+        self.beta_schedule = beta_schedule
         
         # Noise schedule
         if beta_schedule == 'linear':
